@@ -9,7 +9,6 @@ from flask_cors import CORS
 import os
 import tempfile
 import subprocess
-import shutil
 import numpy as np
 import librosa
 import soundfile as sf
@@ -112,13 +111,6 @@ def extract_youtube_audio(youtube_url, output_path):
             '--audio-format', 'wav',
             '--remote-components', 'ejs:github',
         ]
-        cookies_file = os.environ.get('YTDLP_COOKIES_FILE', '/etc/secrets/youtube_cookies.txt')
-        if os.path.exists(cookies_file):
-            # yt-dlp writes updated session cookies back to this path after use;
-            # Render's Secret Files are read-only, so copy to a writable scratch file first
-            writable_cookies = os.path.join(os.path.dirname(output_path), 'cookies.txt')
-            shutil.copy(cookies_file, writable_cookies)
-            cmd += ['--cookies', writable_cookies]
         cmd += ['-o', output_path, youtube_url]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
