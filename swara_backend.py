@@ -110,13 +110,14 @@ def extract_youtube_audio(youtube_url, output_path):
             '-x',
             '--audio-format', 'wav',
             '--remote-components', 'ejs:github',
+            '--extractor-args', 'youtube:player_client=visionos',
         ]
         cmd += ['-o', output_path, youtube_url]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
             if 'Sign in to confirm' in result.stderr or 'not a bot' in result.stderr:
-                logger.error(f"YOUTUBE_COOKIES_EXPIRED: {result.stderr}")
-                raise Exception('YOUTUBE_COOKIES_EXPIRED')
+                logger.error(f"YOUTUBE_BLOCKED: {result.stderr}")
+                raise Exception('YOUTUBE_BLOCKED')
             raise Exception(f"yt-dlp error: {result.stderr}")
         return output_path
     except Exception as e:
@@ -233,7 +234,7 @@ def generate_pdf(swaras, output_path, title="Swara Notation"):
 
 def user_facing_error(e):
     """Map internal error markers to a plain-English message for the frontend"""
-    if str(e) == 'YOUTUBE_COOKIES_EXPIRED':
+    if str(e) == 'YOUTUBE_BLOCKED':
         return "This tool is temporarily unable to reach YouTube and needs a quick fix from the admin. Please try again later."
     return str(e)
 
