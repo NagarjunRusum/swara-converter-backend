@@ -109,9 +109,11 @@ def extract_youtube_audio(youtube_url, output_path):
             '-f', 'bestaudio',
             '-x',
             '--audio-format', 'wav',
-            '-o', output_path,
-            youtube_url
         ]
+        cookies_file = os.environ.get('YTDLP_COOKIES_FILE', '/etc/secrets/youtube_cookies.txt')
+        if os.path.exists(cookies_file):
+            cmd += ['--cookies', cookies_file]
+        cmd += ['-o', output_path, youtube_url]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
             raise Exception(f"yt-dlp error: {result.stderr}")
