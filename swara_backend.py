@@ -107,10 +107,11 @@ def extract_youtube_audio(youtube_url, output_path):
     try:
         cmd = [
             'yt-dlp',
-            '-f', 'bestaudio',
+            '-f', 'bestaudio/best',
             '-x',
             '--audio-format', 'wav',
             '--remote-components', 'ejs:github',
+            '--extractor-args', 'youtube:player_client=tv',
             '-v',
         ]
         cookies_file = os.environ.get('YTDLP_COOKIES_FILE', '/etc/secrets/youtube_cookies.txt')
