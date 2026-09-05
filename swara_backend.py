@@ -116,6 +116,9 @@ def extract_youtube_audio(youtube_url, output_path):
         cmd += ['-o', output_path, youtube_url]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
+            if 'Sign in to confirm' in result.stderr or 'not a bot' in result.stderr:
+                logger.error(f"YOUTUBE_COOKIES_EXPIRED: {result.stderr}")
+                raise Exception('YOUTUBE_COOKIES_EXPIRED')
             raise Exception(f"yt-dlp error: {result.stderr}")
         return output_path
     except Exception as e:
@@ -230,6 +233,12 @@ def generate_pdf(swaras, output_path, title="Swara Notation"):
         logger.error(f"PDF generation failed: {e}")
         raise
 
+def user_facing_error(e):
+    """Map internal error markers to a plain-English message for the frontend"""
+    if str(e) == 'YOUTUBE_COOKIES_EXPIRED':
+        return "This tool is temporarily unable to reach YouTube and needs a quick fix from the admin. Please try again later."
+    return str(e)
+
 @app.route('/api/convert', methods=['POST'])
 def convert():
     """Main endpoint: YouTube URL to Swaras"""
@@ -279,7 +288,7 @@ def convert():
     
     except Exception as e:
         logger.error(f"Conversion failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': user_facing_error(e)}), 500
 
 @app.route('/api/download', methods=['POST'])
 def download():
@@ -318,7 +327,7 @@ def download():
     
     except Exception as e:
         logger.error(f"Download failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': user_facing_error(e)}), 500
 
 @app.route('/api/health', methods=['GET'])
 def health():
