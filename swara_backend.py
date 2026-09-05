@@ -109,6 +109,7 @@ def extract_youtube_audio(youtube_url, output_path):
             '-f', 'bestaudio',
             '-x',
             '--audio-format', 'wav',
+            '--remote-components', 'ejs:github',
         ]
         cookies_file = os.environ.get('YTDLP_COOKIES_FILE', '/etc/secrets/youtube_cookies.txt')
         if os.path.exists(cookies_file):
