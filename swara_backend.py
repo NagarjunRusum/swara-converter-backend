@@ -1,346 +1,285 @@
 #!/usr/bin/env python3
 """
 Swara Converter Backend
-Converts YouTube audio to Indian classical swaras with keyboard mapping
+Upload a song (ideally vocals) -> detect the melody -> auto-detect Sa -> swaras + PDF.
 """
 
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
+import base64
+import logging
 import os
 import tempfile
-import subprocess
-import shutil
-import numpy as np
+import threading
+import time
+import uuid
+
 import librosa
-import soundfile as sf
-from reportlab.lib.pagesizes import letter, A4
-from reportlab.lib.units import inch
-from reportlab.pdfgen import canvas
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+import numpy as np
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from scipy.signal import medfilt
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
-import json
-from pathlib import Path
-import logging
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+MAX_UPLOAD_MB = 60
+MAX_SECONDS = 480          # longer songs risk exhausting a small server
+ALLOWED_EXT = {'.mp3', '.wav', '.m4a', '.ogg', '.flac', '.aac'}
+SR = 16000
+HOP = 640                  # 40 ms per analysis frame
+MIN_NOTE_SEC = 0.08        # shorter blips are treated as noise
+JOB_TTL_SEC = 1800
+
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_MB * 1024 * 1024
 CORS(app)
 
-# Swara definitions - frequency mapping (in cents from C0 at 16.35 Hz)
-SWARA_MAP = {
-    'Sa': 0,      # C
-    'Re': 200,    # D
-    'Ga': 400,    # E
-    'Ma': 500,    # F
-    'Pa': 700,    # G
-    'Dha': 900,   # A
-    'Ni': 1100,   # B
-}
+NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+# Semitones above Sa -> swara (b = komal/flat, # = tivra/sharp)
+SWARA_BY_OFFSET = ['Sa', 'Reb', 'Re', 'Gab', 'Ga', 'Ma', 'Ma#', 'Pa', 'Dhab', 'Dha', 'Nib', 'Ni']
 
-SWARA_TO_NOTE = {
-    'Sa': 'C',
-    'Re': 'D',
-    'Ga': 'E',
-    'Ma': 'F',
-    'Pa': 'G',
-    'Dha': 'A',
-    'Ni': 'B',
-}
+# Krumhansl-Kessler key profiles, used to guess the home note (Sa)
+MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
 
-def cents_to_hz(cents, base_freq=16.35):
-    """Convert cents to Hz"""
-    return base_freq * (2 ** (cents / 1200))
+JOBS = {}
+JOBS_LOCK = threading.Lock()
 
-def hz_to_cents(freq, base_freq=16.35):
-    """Convert Hz to cents from C0"""
-    if freq <= 0:
-        return None
-    return 1200 * np.log2(freq / base_freq)
 
-def freq_to_swara(freq, cents):
-    """Map frequency to nearest swara with octave notation"""
-    if freq is None or cents is None:
-        return None
-    
-    # Get cents from C0
-    c_cents = cents % 1200  # Normalize to one octave
-    
-    # Find nearest swara
-    min_diff = float('inf')
-    nearest_swara = None
-    
-    for swara, swara_cents in SWARA_MAP.items():
-        diff = abs(c_cents - swara_cents)
-        if diff > 600:  # Check wraparound
-            diff = 1200 - diff
-        if diff < min_diff:
-            min_diff = diff
-            nearest_swara = swara
-    
-    # Determine octave
-    octave_num = int(cents / 1200)
-    
-    # Notation: lowercase = octave below, normal = middle, CAPS = octave above
-    if octave_num < 4:
-        notation = nearest_swara.lower()
-    elif octave_num == 4:
-        notation = nearest_swara
+class UserError(Exception):
+    """An error whose message is safe and useful to show to the user."""
+
+
+def extract_notes(audio_path):
+    """Return a list of (start_sec, end_sec, midi_int) notes for the sung melody."""
+    try:
+        duration = librosa.get_duration(path=audio_path)
+    except Exception:
+        raise UserError("Couldn't read that file. Please upload an mp3, wav, m4a, ogg or flac.")
+    if duration > MAX_SECONDS:
+        raise UserError(f"That song is {duration / 60:.1f} minutes long. The limit is {MAX_SECONDS // 60} minutes.")
+
+    y, _ = librosa.load(audio_path, sr=SR, mono=True)
+    f0, voiced, _ = librosa.pyin(y, fmin=65, fmax=1050, sr=SR, frame_length=2048, hop_length=HOP)
+    good = voiced & ~np.isnan(f0)
+    if good.sum() < 20:
+        raise UserError("Couldn't find a clear melody in this audio. A vocals-only file works best.")
+
+    # Correct for songs that aren't tuned exactly to A=440
+    tuning = librosa.pitch_tuning(f0[good])
+    midi = np.full(len(f0), np.nan)
+    midi[good] = librosa.hz_to_midi(f0[good]) - tuning
+
+    # Median-smooth each continuous sung stretch to remove pitch jitter
+    padded = np.concatenate([[False], good, [False]])
+    edges = np.flatnonzero(np.diff(padded.astype(int)))
+    for start, end in zip(edges[::2], edges[1::2]):
+        if end - start >= 5:
+            midi[start:end] = medfilt(midi[start:end], 5)
+
+    frame_sec = HOP / SR
+    notes = []  # [start, end, midi]
+    for i, m in enumerate(midi):
+        if np.isnan(m):
+            continue
+        q = int(round(m))
+        t = i * frame_sec
+        if notes and notes[-1][2] == q and t - notes[-1][1] <= frame_sec * 1.5:
+            notes[-1][1] = t + frame_sec
+        else:
+            notes.append([t, t + frame_sec, q])
+
+    notes = [n for n in notes if n[1] - n[0] >= MIN_NOTE_SEC]
+    # Re-merge same-pitch neighbours separated only by a dropped blip
+    merged = []
+    for n in notes:
+        if merged and merged[-1][2] == n[2] and n[0] - merged[-1][1] <= 0.15:
+            merged[-1][1] = n[1]
+        else:
+            merged.append(n)
+    if len(merged) < 3:
+        raise UserError("Couldn't find enough notes in this audio. A vocals-only file works best.")
+    return merged
+
+
+def detect_sa(notes):
+    """Guess Sa (the home note) from which pitches the melody dwells on."""
+    hist = np.zeros(12)
+    for start, end, midi in notes:
+        hist[midi % 12] += end - start
+    best_score, best_pc = -2, 0
+    for pc in range(12):
+        rotated = np.roll(hist, -pc)  # rotated[0] is the candidate home note
+        for profile in (MAJOR_PROFILE, MINOR_PROFILE):
+            score = np.corrcoef(rotated, profile)[0, 1]
+            if score > best_score:
+                best_score, best_pc = score, pc
+    return best_pc, float(best_score)
+
+
+def label_notes(notes, sa_pc):
+    """Turn midi notes into swara labels, with octave shown by letter case."""
+    pitches = np.array([n[2] for n in notes])
+    med = int(round(np.median(pitches)))
+    sa_ref = med - ((med - sa_pc) % 12)  # Sa at or just below the typical sung pitch
+    out = []
+    for start, end, midi in notes:
+        rel = midi - sa_ref
+        octave, offset = divmod(rel, 12)
+        name = SWARA_BY_OFFSET[offset]
+        if octave < 0:
+            name = name.lower()
+        elif octave > 0:
+            name = name.upper()
+        out.append({
+            'swara': name,
+            'keyboard': NOTE_NAMES[midi % 12],
+            'midi': int(midi),
+            'offset': int(offset),
+            'time': round(float(start), 2),
+            'duration': round(float(end - start), 2),
+        })
+    return out
+
+
+def generate_pdf(items, sa_name):
+    """Build the practice sheet PDF and return its bytes."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, 'swaras.pdf')
+        doc = SimpleDocTemplate(path, pagesize=A4, topMargin=0.5 * inch, bottomMargin=0.5 * inch)
+        base = getSampleStyleSheet()
+        story = [
+            Paragraph("Swara Notation", ParagraphStyle('T', parent=base['Heading1'], fontSize=24,
+                                                      alignment=TA_CENTER, spaceAfter=6)),
+            Paragraph(f"Sa = {sa_name} on the keyboard", ParagraphStyle('S', parent=base['Normal'], fontSize=12,
+                                                                      alignment=TA_CENTER, textColor=colors.HexColor('#444444'))),
+            Spacer(1, 0.2 * inch),
+        ]
+        line_style = ParagraphStyle('L', parent=base['Normal'], fontSize=18, fontName='Courier-Bold',
+                                    alignment=TA_CENTER, leading=22, spaceAfter=2)
+        key_style = ParagraphStyle('K', parent=base['Normal'], fontSize=10, textColor=colors.grey,
+                                   alignment=TA_CENTER, spaceAfter=16)
+        per_line = 12
+        for i in range(0, len(items), per_line):
+            chunk = items[i:i + per_line]
+            story.append(Paragraph(' '.join(c['swara'] for c in chunk), line_style))
+            story.append(Paragraph('(' + ' '.join(c['keyboard'] for c in chunk) + ')', key_style))
+        story.append(Spacer(1, 0.3 * inch))
+        story.append(Paragraph(
+            "<b>Notation guide:</b> lowercase (sa) = lower octave | Normal (Sa) = middle octave | "
+            "UPPERCASE (SA) = higher octave<br/>b after a name = komal (flat), # = tivra (sharp), "
+            "e.g. Gab = komal Ga. Grey letters below each line are the keyboard keys.",
+            ParagraphStyle('G', parent=base['Normal'], fontSize=10, textColor=colors.HexColor('#666666'))))
+        doc.build(story)
+        with open(path, 'rb') as f:
+            return f.read()
+
+
+def process_audio(path, sa_override, set_stage):
+    set_stage('Listening for the melody...')
+    notes = extract_notes(path)
+    set_stage('Working out Sa and the swaras...')
+    if sa_override:
+        sa_pc, confidence = NOTE_NAMES.index(sa_override), None
     else:
-        notation = nearest_swara.upper()
-    
-    keyboard_note = SWARA_TO_NOTE[nearest_swara]
-    
+        sa_pc, confidence = detect_sa(notes)
+    items = label_notes(notes, sa_pc)
+    sa_name = NOTE_NAMES[sa_pc]
+    set_stage('Building your PDF...')
+    pdf = generate_pdf(items, sa_name)
     return {
-        'swara': notation,
-        'swara_name': nearest_swara,
-        'keyboard': keyboard_note,
-        'frequency': freq,
-        'confidence': 1.0 - (min_diff / 100)  # Rough confidence
+        'swaras': [i['swara'] for i in items],
+        'notes': items,
+        'count': len(items),
+        'duration': items[-1]['time'],
+        'sa': sa_name,
+        'sa_auto': sa_override is None,
+        'sa_confidence': None if confidence is None else round(confidence, 2),
+        'pdf_base64': base64.b64encode(pdf).decode('ascii'),
     }
 
-def extract_youtube_audio(youtube_url, output_path):
-    """Extract audio from YouTube using yt-dlp"""
-    try:
-        cmd = [
-            'yt-dlp',
-            '-f', 'bestaudio/best',
-            '-x',
-            '--audio-format', 'wav',
-            '--remote-components', 'ejs:github',
-            '--extractor-args', 'youtube:player_client=tv',
-            '-v',
-        ]
-        cookies_file = os.environ.get('YTDLP_COOKIES_FILE', '/etc/secrets/youtube_cookies.txt')
-        if os.path.exists(cookies_file):
-            # yt-dlp writes updated session cookies back to this path after use;
-            # Render's Secret Files are read-only, so copy to a writable scratch file first
-            writable_cookies = os.path.join(os.path.dirname(output_path), 'cookies.txt')
-            shutil.copy(cookies_file, writable_cookies)
-            cmd += ['--cookies', writable_cookies]
-        cmd += ['-o', output_path, youtube_url]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            if 'Sign in to confirm' in result.stderr or 'not a bot' in result.stderr:
-                logger.error(f"YOUTUBE_BLOCKED: {result.stderr}")
-                raise Exception('YOUTUBE_BLOCKED')
-            raise Exception(f"yt-dlp error: {result.stderr}")
-        return output_path
-    except Exception as e:
-        logger.error(f"YouTube extraction failed: {e}")
-        raise
 
-def detect_melodic_line(audio_path, sr=22050):
-    """Detect the melodic line (dominant frequency) from audio"""
+def run_job(job_id, path, sa_override):
+    def set_stage(text):
+        with JOBS_LOCK:
+            JOBS[job_id]['stage'] = text
     try:
-        # Load audio
-        y, sr = librosa.load(audio_path, sr=sr)
-        
-        # Compute STFT for pitch tracking
-        S = np.abs(librosa.stft(y))
-        
-        # Use librosa's pYIN for pitch detection (more robust)
-        f0, voiced_flag, voiced_probs = librosa.pyin(
-            y, 
-            fmin=50,  # Minimum frequency (below Sa)
-            fmax=2000,  # Maximum frequency
-            sr=sr
-        )
-        
-        # Get time frames
-        times = librosa.frames_to_time(np.arange(len(f0)), sr=sr)
-        
-        # Convert to swaras
-        swaras = []
-        for i, (freq, is_voiced, confidence) in enumerate(zip(f0, voiced_flag, voiced_probs)):
-            if is_voiced and freq > 0:
-                cents = hz_to_cents(freq)
-                swara_info = freq_to_swara(freq, cents)
-                if swara_info:
-                    swara_info['time'] = float(times[i])
-                    swara_info['voiced_confidence'] = float(confidence)
-                    swaras.append(swara_info)
-        
-        return swaras, sr
-    except Exception as e:
-        logger.error(f"Pitch detection failed: {e}")
-        raise
+        result = process_audio(path, sa_override, set_stage)
+        with JOBS_LOCK:
+            JOBS[job_id].update(status='done', result=result)
+    except UserError as e:
+        with JOBS_LOCK:
+            JOBS[job_id].update(status='error', error=str(e))
+    except Exception:
+        logger.exception("Job failed")
+        with JOBS_LOCK:
+            JOBS[job_id].update(status='error', error="Something went wrong while processing this song. Please try another file.")
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
-def generate_pdf(swaras, output_path, title="Swara Notation"):
-    """Generate PDF with swara notation"""
-    try:
-        doc = SimpleDocTemplate(output_path, pagesize=A4, 
-                               topMargin=0.5*inch, bottomMargin=0.5*inch)
-        story = []
-        
-        # Title
-        title_style = ParagraphStyle(
-            'CustomTitle',
-            parent=getSampleStyleSheet()['Heading1'],
-            fontSize=24,
-            textColor=colors.HexColor('#1a1a1a'),
-            spaceAfter=30,
-            alignment=TA_CENTER
-        )
-        story.append(Paragraph(title, title_style))
-        story.append(Spacer(1, 0.2*inch))
-        
-        # Swaras in lines (like sheet music)
-        # Group swaras in lines of ~16 per line for readability
-        swaras_per_line = 16
-        
-        line_style = ParagraphStyle(
-            'SwaraLine',
-            parent=getSampleStyleSheet()['Normal'],
-            fontSize=20,
-            fontName='Courier-Bold',
-            alignment=TA_CENTER,
-            spaceAfter=12,
-            leading=24
-        )
-        
-        for i in range(0, len(swaras), swaras_per_line):
-            chunk = swaras[i:i + swaras_per_line]
-            # Create swara line
-            swara_text = ' '.join([s['swara'] for s in chunk])
-            story.append(Paragraph(swara_text, line_style))
-            
-            # Create keyboard mapping line below
-            keyboard_text = ' '.join([s['keyboard'] for s in chunk])
-            keyboard_style = ParagraphStyle(
-                'Keyboard',
-                parent=getSampleStyleSheet()['Normal'],
-                fontSize=10,
-                textColor=colors.grey,
-                alignment=TA_CENTER,
-                spaceAfter=20
-            )
-            story.append(Paragraph(f"({keyboard_text})", keyboard_style))
-        
-        # Add legend
-        story.append(Spacer(1, 0.3*inch))
-        legend_style = ParagraphStyle(
-            'Legend',
-            parent=getSampleStyleSheet()['Normal'],
-            fontSize=10,
-            textColor=colors.HexColor('#666666')
-        )
-        legend_text = """
-        <b>Notation Guide:</b><br/>
-        Lowercase (sa) = Lower octave | Normal (Sa) = Middle octave | UPPERCASE (SA) = Higher octave<br/>
-        Keyboard mapping below each line shows corresponding piano keys
-        """
-        story.append(Paragraph(legend_text, legend_style))
-        
-        doc.build(story)
-        return output_path
-    except Exception as e:
-        logger.error(f"PDF generation failed: {e}")
-        raise
 
-def user_facing_error(e):
-    """Map internal error markers to a plain-English message for the frontend"""
-    if str(e) == 'YOUTUBE_BLOCKED':
-        return "This tool is temporarily unable to reach YouTube and needs a quick fix from the admin. Please try again later."
-    return str(e)
+def purge_old_jobs():
+    cutoff = time.time() - JOB_TTL_SEC
+    with JOBS_LOCK:
+        for jid in [j for j, v in JOBS.items() if v['created'] < cutoff]:
+            del JOBS[jid]
+
 
 @app.route('/api/convert', methods=['POST'])
 def convert():
-    """Main endpoint: YouTube URL to Swaras"""
-    try:
-        data = request.json
-        youtube_url = data.get('youtube_url', '').strip()
-        
-        if not youtube_url:
-            return jsonify({'error': 'YouTube URL required'}), 400
-        
-        # Create temp directory
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Extract audio
-            logger.info(f"Extracting audio from {youtube_url}")
-            audio_path = os.path.join(tmpdir, 'audio.wav')
-            extract_youtube_audio(youtube_url, audio_path)
-            
-            # Detect swaras
-            logger.info("Detecting melodic line...")
-            swaras, sr = detect_melodic_line(audio_path)
-            
-            if not swaras:
-                return jsonify({'error': 'Could not detect melodic line'}), 400
-            
-            # Clean up swaras - remove very close duplicates
-            cleaned_swaras = []
-            last_swara = None
-            for swara in swaras:
-                if last_swara is None or swara['swara'] != last_swara['swara'] or swara['time'] - last_swara['time'] > 0.1:
-                    cleaned_swaras.append(swara)
-                    last_swara = swara
-            
-            # Generate PDF
-            logger.info("Generating PDF...")
-            pdf_path = os.path.join(tmpdir, 'swaras.pdf')
-            generate_pdf(cleaned_swaras, pdf_path)
-            
-            # Read PDF and return
-            with open(pdf_path, 'rb') as f:
-                pdf_data = f.read()
-            
-            return {
-                'swaras': [s['swara'] for s in cleaned_swaras],
-                'count': len(cleaned_swaras),
-                'duration': cleaned_swaras[-1]['time'] if cleaned_swaras else 0
-            }
-    
-    except Exception as e:
-        logger.error(f"Conversion failed: {e}")
-        return jsonify({'error': user_facing_error(e)}), 500
+    """Accept an audio upload and start a background job."""
+    purge_old_jobs()
+    upload = request.files.get('file')
+    if not upload or not upload.filename:
+        return jsonify({'error': 'Please choose an audio file to upload.'}), 400
+    ext = os.path.splitext(upload.filename)[1].lower()
+    if ext not in ALLOWED_EXT:
+        return jsonify({'error': 'Please upload an mp3, wav, m4a, ogg or flac file.'}), 400
+    sa_override = (request.form.get('sa') or '').strip().upper() or None
+    if sa_override and sa_override not in NOTE_NAMES:
+        return jsonify({'error': 'Unknown Sa note.'}), 400
 
-@app.route('/api/download', methods=['POST'])
-def download():
-    """Download the PDF"""
-    try:
-        data = request.json
-        youtube_url = data.get('youtube_url', '').strip()
-        
-        if not youtube_url:
-            return jsonify({'error': 'YouTube URL required'}), 400
-        
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Extract audio
-            audio_path = os.path.join(tmpdir, 'audio.wav')
-            extract_youtube_audio(youtube_url, audio_path)
-            
-            # Detect swaras
-            swaras, sr = detect_melodic_line(audio_path)
-            
-            if not swaras:
-                return jsonify({'error': 'Could not detect melodic line'}), 400
-            
-            # Clean up swaras
-            cleaned_swaras = []
-            last_swara = None
-            for swara in swaras:
-                if last_swara is None or swara['swara'] != last_swara['swara'] or swara['time'] - last_swara['time'] > 0.1:
-                    cleaned_swaras.append(swara)
-                    last_swara = swara
-            
-            # Generate PDF
-            pdf_path = os.path.join(tmpdir, 'swaras.pdf')
-            generate_pdf(cleaned_swaras, pdf_path)
-            
-            return send_file(pdf_path, mimetype='application/pdf', as_attachment=True, download_name='swaras.pdf')
-    
-    except Exception as e:
-        logger.error(f"Download failed: {e}")
-        return jsonify({'error': user_facing_error(e)}), 500
+    fd, path = tempfile.mkstemp(suffix=ext)
+    os.close(fd)
+    upload.save(path)
+    job_id = uuid.uuid4().hex
+    with JOBS_LOCK:
+        JOBS[job_id] = {'status': 'running', 'stage': 'Starting...', 'created': time.time()}
+    threading.Thread(target=run_job, args=(job_id, path, sa_override), daemon=True).start()
+    return jsonify({'job_id': job_id}), 202
+
+
+@app.route('/api/jobs/<job_id>', methods=['GET'])
+def job_status(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify({'error': 'Job not found. It may have expired - please upload again.'}), 404
+        body = {'status': job['status'], 'stage': job.get('stage')}
+        if job['status'] == 'done':
+            body['result'] = job['result']
+        elif job['status'] == 'error':
+            body['error'] = job['error']
+    return jsonify(body)
+
+
+@app.errorhandler(413)
+def too_large(_):
+    return jsonify({'error': f'That file is too large. The limit is {MAX_UPLOAD_MB} MB.'}), 413
+
 
 @app.route('/api/health', methods=['GET'])
 def health():
-    """Health check endpoint"""
     return jsonify({'status': 'ok'})
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))

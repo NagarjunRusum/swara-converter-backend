@@ -1,1 +1,1 @@
-web: gunicorn swara_backend:app --bind 0.0.0.0:$PORT --timeout 120
+web: gunicorn swara_backend:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
