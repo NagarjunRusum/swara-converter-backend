@@ -7,6 +7,7 @@ Upload a song (ideally vocals) -> detect the melody -> auto-detect Sa -> swaras 
 import base64
 import logging
 import os
+import subprocess
 import tempfile
 import threading
 import time
@@ -32,6 +33,7 @@ MAX_SECONDS = 480          # longer songs risk exhausting a small server
 ALLOWED_EXT = {'.mp3', '.wav', '.m4a', '.ogg', '.flac', '.aac'}
 SR = 16000
 HOP = 640                  # 40 ms per analysis frame
+CHUNK_SEC = 15             # pitch is tracked this many seconds at a time to limit memory
 MIN_NOTE_SEC = 0.08        # shorter blips are treated as noise
 JOB_TTL_SEC = 1800
 
@@ -55,17 +57,40 @@ class UserError(Exception):
     """An error whose message is safe and useful to show to the user."""
 
 
+def decode_audio(path):
+    """Decode any audio file to 16 kHz mono floats with ffmpeg (far lighter on memory than librosa.load)."""
+    cmd = ['ffmpeg', '-v', 'error', '-i', path, '-t', str(MAX_SECONDS + 1),
+           '-ac', '1', '-ar', str(SR), '-f', 'f32le', '-']
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=120)
+    except (subprocess.TimeoutExpired, OSError):
+        raise UserError("Couldn't read that file. Please upload an mp3, wav, m4a, ogg or flac.")
+    if result.returncode != 0 or len(result.stdout) < SR * 4:
+        raise UserError("Couldn't read that file. Please upload an mp3, wav, m4a, ogg or flac.")
+    return np.frombuffer(result.stdout, dtype=np.float32)
+
+
 def extract_notes(audio_path):
     """Return a list of (start_sec, end_sec, midi_int) notes for the sung melody."""
-    try:
-        duration = librosa.get_duration(path=audio_path)
-    except Exception:
-        raise UserError("Couldn't read that file. Please upload an mp3, wav, m4a, ogg or flac.")
-    if duration > MAX_SECONDS:
-        raise UserError(f"That song is {duration / 60:.1f} minutes long. The limit is {MAX_SECONDS // 60} minutes.")
+    y = decode_audio(audio_path)
+    if len(y) > MAX_SECONDS * SR:
+        raise UserError(f"That song is longer than {MAX_SECONDS // 60} minutes. Please upload a shorter one.")
 
-    y, _ = librosa.load(audio_path, sr=SR, mono=True)
-    f0, voiced, _ = librosa.pyin(y, fmin=65, fmax=1050, sr=SR, frame_length=2048, hop_length=HOP)
+    # Track pitch in short pieces: doing a whole song at once needs well over 1 GB of memory
+    chunk = CHUNK_SEC * SR  # a multiple of HOP, so frame times line up across pieces
+    f0_parts, voiced_parts = [], []
+    for s in range(0, len(y), chunk):
+        piece = y[s:s + chunk]
+        is_last = s + chunk >= len(y)
+        if len(piece) < SR // 2:
+            break
+        f0_p, voiced_p, _ = librosa.pyin(piece, fmin=65, fmax=1050, sr=SR, frame_length=2048, hop_length=HOP)
+        keep = len(f0_p) if is_last else len(piece) // HOP  # last frame of a piece repeats the next piece's first
+        f0_parts.append(f0_p[:keep])
+        voiced_parts.append(voiced_p[:keep])
+    del y
+    f0 = np.concatenate(f0_parts)
+    voiced = np.concatenate(voiced_parts)
     good = voiced & ~np.isnan(f0)
     if good.sum() < 20:
         raise UserError("Couldn't find a clear melody in this audio. A vocals-only file works best.")
