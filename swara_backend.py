@@ -37,13 +37,19 @@ HOP = 640                  # 40 ms per analysis frame
 CHUNK_SEC = 15             # pitch is tracked this many seconds at a time to limit memory
 SILENCE_LEVEL = 0.03       # under 3% of the loudest moment counts as silence
 SILENCE_SKIP_SEC = 1.0     # silent stretches at least this long are not analysed at all
-# n_thresholds 50 is ~1.3x faster than the default 100 with no loss of notes. Coarser
-# `resolution` (0.2) is ~3x faster but drops many notes, so it is deliberately not used.
-PYIN_SETTINGS = dict(fmin=65, fmax=1050, sr=SR, frame_length=2048, hop_length=HOP, n_thresholds=50)
+# Tuned against a family-notated song (swara-tests/honge-kamyab): n_thresholds 50 is ~1.3x
+# faster with no loss; max_transition_rate 70 and switch_prob 0.03 let the tracker follow quick
+# note changes (recall 61% -> 75%). Coarser `resolution` is ~3x faster but drops notes, so it is not used.
+PYIN_SETTINGS = dict(fmin=65, fmax=1050, sr=SR, frame_length=2048, hop_length=HOP, n_thresholds=50,
+                     max_transition_rate=70, switch_prob=0.03)
 REGLUE_GAP_SEC = 0.05     # same-pitch notes closer than this are one note (a glitch, not a repeat)
+MEDIAN_KERNEL = 3          # frames of pitch smoothing (5 blurred short notes)
+DIP_RATIO = 0.6            # loudness valley (vs neighbours) that marks a re-struck note
+DIP_WINDOW = 5             # frames each side used to judge a valley
+DIP_MIN_NOTE_SEC = 0.16    # a note must already be this long before it can be split
 MIN_NOTE_SEC = 0.08        # shorter blips are treated as noise
 JOB_TTL_SEC = 1800
-PITCH_VERSION = 'p3'       # bump when the pitch-tracking settings below change
+PITCH_VERSION = 'p4'       # bump when the pitch-tracking settings below change
 CACHE_DIR = os.path.join(tempfile.gettempdir(), 'swara_pitch_cache')
 CACHE_MAX_FILES = 20
 
@@ -193,18 +199,18 @@ def extract_notes(audio_path, on_progress=None):
     padded = np.concatenate([[False], good, [False]])
     edges = np.flatnonzero(np.diff(padded.astype(int)))
     for start, end in zip(edges[::2], edges[1::2]):
-        if end - start >= 5:
-            midi[start:end] = medfilt(midi[start:end], 5)
+        if end - start >= MEDIAN_KERNEL:
+            midi[start:end] = medfilt(midi[start:end], MEDIAN_KERNEL)
 
     frame_sec = HOP / SR
     rms = np.concatenate([rms, np.zeros(max(0, len(midi) - len(rms)))])[:len(midi)]
 
     def is_dip(i):
         """True if frame i is a clear loudness valley, i.e. the singer re-struck the same pitch."""
-        left, right = rms[max(0, i - 5):i], rms[i + 1:i + 6]
+        left, right = rms[max(0, i - DIP_WINDOW):i], rms[i + 1:i + DIP_WINDOW + 1]
         if len(left) < 2 or len(right) < 2:
             return False
-        return rms[i] < 0.6 * min(left.max(), right.max())
+        return rms[i] < DIP_RATIO * min(left.max(), right.max())
 
     notes = []  # [start, end, midi, started_by_restrike]
     restrike = False
@@ -214,7 +220,7 @@ def extract_notes(audio_path, on_progress=None):
         q = int(round(m))
         t = i * frame_sec
         if notes and notes[-1][2] == q and t - notes[-1][1] <= frame_sec * 1.5:
-            if is_dip(i) and t - notes[-1][0] >= 0.16:
+            if is_dip(i) and t - notes[-1][0] >= DIP_MIN_NOTE_SEC:
                 restrike = True      # the dip frame itself belongs to neither note
             elif restrike:
                 notes.append([t, t + frame_sec, q, True])
@@ -290,6 +296,33 @@ def detect_sa(notes):
             if score > best_score:
                 best_score, best_pc = score, pc
     return best_pc, float(best_score)
+
+
+MAJOR_SCALE = {0, 2, 4, 5, 7, 9, 11}
+
+
+def snap_to_white_keys(notes, sa_pc):
+    """For songs that use only the 7 plain swaras: drop short black-key notes (slides) and
+    move longer ones to the neighbouring white key that matches the surrounding notes."""
+    out = []
+    for i, (start, end, midi) in enumerate(notes):
+        if (midi - sa_pc) % 12 in MAJOR_SCALE:
+            out.append([start, end, midi])
+            continue
+        if end - start < 0.2:
+            continue
+        prev = out[-1][2] if out else None
+        nxt = notes[i + 1][2] if i + 1 < len(notes) else None
+        options = [c for c in (midi - 1, midi + 1) if (c - sa_pc) % 12 in MAJOR_SCALE]
+        pick = [c for c in options if c in (prev, nxt)] or options
+        out.append([start, end, min(pick)])
+    glued = []
+    for n in out:
+        if glued and glued[-1][2] == n[2] and n[0] - glued[-1][1] < 0.08:
+            glued[-1][1] = n[1]
+        else:
+            glued.append(n)
+    return [tuple(n) for n in glued]
 
 
 def label_notes(notes, sa_pc):
@@ -389,7 +422,7 @@ def generate_pdf(items, sa_name, transpose):
             return f.read()
 
 
-def process_audio(path, sa_override, set_stage):
+def process_audio(path, sa_override, set_stage, white_keys_only=False):
     set_stage('Listening for the melody...', 0.02)
     notes = extract_notes(path, lambda fraction: set_stage(None, fraction))
     set_stage('Working out Sa and the swaras...', 0.96)
@@ -397,6 +430,8 @@ def process_audio(path, sa_override, set_stage):
         sa_pc, confidence = NOTE_NAMES.index(sa_override), None
     else:
         sa_pc, confidence = detect_sa(notes)
+    if white_keys_only:
+        notes = snap_to_white_keys(notes, sa_pc)
     items = label_notes(notes, sa_pc)
     sa_name = NOTE_NAMES[sa_pc]
     set_stage('Building your PDF...', 0.98)
@@ -410,12 +445,13 @@ def process_audio(path, sa_override, set_stage):
         'sa': sa_name,
         'transpose': transpose,
         'sa_auto': sa_override is None,
+        'white_keys_only': white_keys_only,
         'sa_confidence': None if confidence is None else round(confidence, 2),
         'pdf_base64': base64.b64encode(pdf).decode('ascii'),
     }
 
 
-def run_job(job_id, path, sa_override):
+def run_job(job_id, path, sa_override, white_keys_only=False):
     def set_stage(text, progress=None):
         with JOBS_LOCK:
             if text:
@@ -423,7 +459,7 @@ def run_job(job_id, path, sa_override):
             if progress is not None:
                 JOBS[job_id]['progress'] = round(progress, 3)
     try:
-        result = process_audio(path, sa_override, set_stage)
+        result = process_audio(path, sa_override, set_stage, white_keys_only)
         with JOBS_LOCK:
             JOBS[job_id].update(status='done', result=result)
     except UserError as e:
@@ -467,7 +503,8 @@ def convert():
     job_id = uuid.uuid4().hex
     with JOBS_LOCK:
         JOBS[job_id] = {'status': 'running', 'stage': 'Starting...', 'progress': 0.0, 'created': time.time()}
-    threading.Thread(target=run_job, args=(job_id, path, sa_override), daemon=True).start()
+    white_keys_only = request.form.get('white') == '1'
+    threading.Thread(target=run_job, args=(job_id, path, sa_override, white_keys_only), daemon=True).start()
     return jsonify({'job_id': job_id}), 202
 
 
