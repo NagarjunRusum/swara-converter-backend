@@ -51,11 +51,11 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_MB * 1024 * 1024
 CORS(app)
 
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-# Semitones above Sa -> (swara, sharp?). Every black key is written as the swara just
-# below it plus '#', so '#' always means "the black key right after this one".
-SWARA_AND_SHARP = [('sa', False), ('sa', True), ('re', False), ('re', True), ('ga', False),
-                   ('ma', False), ('ma', True), ('pa', False), ('pa', True), ('dha', False),
-                   ('dha', True), ('ni', False)]
+# Semitones above Sa -> (swara, marked?). A black key keeps the name of the swara just to
+# its RIGHT (its komal / tivra form) with a '#' added: re#, ga#, ma#, dha#, ni#.
+SWARA_AND_SHARP = [('sa', False), ('re', True), ('re', False), ('ga', True), ('ga', False),
+                   ('ma', False), ('ma', True), ('pa', False), ('dha', True), ('dha', False),
+                   ('ni', True), ('ni', False)]
 HIGHER_FORM = {'sa': 's\u00e0', 're': 'r\u00e8', 'ga': 'g\u00e0', 'ma': 'm\u00e0',
                'pa': 'p\u00e0', 'dha': 'dh\u00e0', 'ni': 'n\u00ec'}  # grave accent = higher octave
 PHRASE_GAP_SEC = 0.8       # a pause this long starts a new phrase
@@ -370,7 +370,7 @@ def generate_pdf(items, sa_name, transpose):
         story.append(Spacer(1, 0.3 * inch))
         story.append(Paragraph(
             "<b>How to read this:</b> sa. = lower octave | sa = middle octave | s\u00e0 = higher octave<br/>"
-            "A # after a swara (sa#, re#, ma#...) means the black key right after that swara's key.<br/>"
+            "A # after a swara (re#, ga#, ma#, dha#, ni#) means the black key just before (left of) that swara's key.<br/>"
             "A dash (\u2014) after a swara means hold that note for longer.<br/>"
             "The grey letters under each line are the keys to press, counting sa as C.",
             ParagraphStyle('G', parent=base['Normal'], fontSize=10, textColor=colors.HexColor('#666666'),
