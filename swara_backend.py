@@ -374,12 +374,14 @@ def keyboard_transpose(sa_pc):
 
 
 def play_instruction(sa_name, transpose):
+    """Main line: always play sa as C. Second line: optional transpose to match the recording."""
+    main = "Play with sa = C on the keyboard."
     if transpose == 0:
-        return "Play with sa = C on the keyboard (this song's Sa is also C, so no transpose needed)."
-    direction = 'up' if transpose > 0 else 'down'
-    return (f"Play with sa = C on the keyboard. This song's real Sa is {sa_name}: "
-            f"set your keyboard's TRANSPOSE to {transpose:+d} ({abs(transpose)} semitone"
-            f"{'s' if abs(transpose) > 1 else ''} {direction}) so it sounds like the song.")
+        return main, "This recording is also in C."
+    direction = 'down' if transpose < 0 else 'up'
+    optional = (f"Optional: the recording's Sa is {sa_name}. To sound exactly like it, set your keyboard's "
+                f"TRANSPOSE to {transpose:+d} ({abs(transpose)} semitone{'s' if abs(transpose) > 1 else ''} {direction}).")
+    return main, optional
 
 
 def generate_pdf(items, sa_name, transpose):
@@ -391,9 +393,12 @@ def generate_pdf(items, sa_name, transpose):
         story = [
             Paragraph("Swara Notation", ParagraphStyle('T', parent=base['Heading1'], fontSize=24,
                                                       alignment=TA_CENTER, spaceAfter=6)),
-            Paragraph(play_instruction(sa_name, transpose), ParagraphStyle(
-                'S', parent=base['Normal'], fontSize=12, leading=16, alignment=TA_CENTER,
-                textColor=colors.HexColor('#444444'))),
+            Paragraph(play_instruction(sa_name, transpose)[0], ParagraphStyle(
+                'S', parent=base['Normal'], fontSize=13, leading=17, alignment=TA_CENTER,
+                textColor=colors.HexColor('#333333'))),
+            Paragraph(play_instruction(sa_name, transpose)[1], ParagraphStyle(
+                'S2', parent=base['Normal'], fontSize=9, leading=12, alignment=TA_CENTER,
+                textColor=colors.HexColor('#888888'))),
             Spacer(1, 0.2 * inch),
         ]
         line_style = ParagraphStyle('L', parent=base['Normal'], fontSize=18, fontName='Courier-Bold',
