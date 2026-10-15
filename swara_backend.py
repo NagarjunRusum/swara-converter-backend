@@ -307,8 +307,10 @@ def label_notes(notes, sa_pc):
             'komal': komal,
             'dashes': dashes,
             'swara': text + ('(k)' if komal else '') + (' ' + ' '.join(['\u2014'] * dashes) if dashes else ''),
-            'keyboard': NOTE_NAMES[midi % 12],
-            'midi': int(midi),
+            'keyboard': NOTE_NAMES[offset],                    # key to press, with Sa = C
+            'midi': 60 + offset + 12 * octave,                 # same, for MIDI playback (Sa = middle C)
+            'real_keyboard': NOTE_NAMES[midi % 12],            # the pitch actually sung in the song
+            'real_midi': int(midi),
             'offset': int(offset),
             'time': round(float(start), 2),
             'duration': round(float(end - start), 2),
@@ -316,7 +318,21 @@ def label_notes(notes, sa_pc):
     return out
 
 
-def generate_pdf(items, sa_name):
+def keyboard_transpose(sa_pc):
+    """Semitones to transpose the keyboard so that playing Sa as C sounds at the song's Sa."""
+    return sa_pc if sa_pc <= 6 else sa_pc - 12
+
+
+def play_instruction(sa_name, transpose):
+    if transpose == 0:
+        return "Play with sa = C on the keyboard (this song's Sa is also C, so no transpose needed)."
+    direction = 'up' if transpose > 0 else 'down'
+    return (f"Play with sa = C on the keyboard. This song's real Sa is {sa_name}: "
+            f"set your keyboard's TRANSPOSE to {transpose:+d} ({abs(transpose)} semitone"
+            f"{'s' if abs(transpose) > 1 else ''} {direction}) so it sounds like the song.")
+
+
+def generate_pdf(items, sa_name, transpose):
     """Build the practice sheet PDF and return its bytes."""
     with tempfile.TemporaryDirectory() as tmpdir:
         path = os.path.join(tmpdir, 'swaras.pdf')
@@ -325,8 +341,9 @@ def generate_pdf(items, sa_name):
         story = [
             Paragraph("Swara Notation", ParagraphStyle('T', parent=base['Heading1'], fontSize=24,
                                                       alignment=TA_CENTER, spaceAfter=6)),
-            Paragraph(f"Sa = {sa_name} on the keyboard", ParagraphStyle('S', parent=base['Normal'], fontSize=12,
-                                                                      alignment=TA_CENTER, textColor=colors.HexColor('#444444'))),
+            Paragraph(play_instruction(sa_name, transpose), ParagraphStyle(
+                'S', parent=base['Normal'], fontSize=12, leading=16, alignment=TA_CENTER,
+                textColor=colors.HexColor('#444444'))),
             Spacer(1, 0.2 * inch),
         ]
         line_style = ParagraphStyle('L', parent=base['Normal'], fontSize=18, fontName='Courier-Bold',
@@ -357,7 +374,7 @@ def generate_pdf(items, sa_name):
             "<b>How to read this:</b> sa. = lower octave | sa = middle octave | s\u00e0 = higher octave<br/>"
             "An <u>underlined</u> swara is komal (flat). A swara with ' after it, like ma', is tivra (sharp).<br/>"
             "A dash (\u2014) after a swara means hold that note for longer.<br/>"
-            "The grey letters under each line are the keyboard keys to press.",
+            "The grey letters under each line are the keys to press, counting sa as C.",
             ParagraphStyle('G', parent=base['Normal'], fontSize=10, textColor=colors.HexColor('#666666'),
                            leading=14)))
         doc.build(story)
@@ -376,13 +393,15 @@ def process_audio(path, sa_override, set_stage):
     items = label_notes(notes, sa_pc)
     sa_name = NOTE_NAMES[sa_pc]
     set_stage('Building your PDF...', 0.98)
-    pdf = generate_pdf(items, sa_name)
+    transpose = keyboard_transpose(sa_pc)
+    pdf = generate_pdf(items, sa_name, transpose)
     return {
         'swaras': [i['swara'] for i in items],
         'notes': items,
         'count': len(items),
         'duration': items[-1]['time'],
         'sa': sa_name,
+        'transpose': transpose,
         'sa_auto': sa_override is None,
         'sa_confidence': None if confidence is None else round(confidence, 2),
         'pdf_base64': base64.b64encode(pdf).decode('ascii'),
