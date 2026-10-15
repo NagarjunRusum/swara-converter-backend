@@ -70,15 +70,18 @@ def decode_audio(path):
     return np.frombuffer(result.stdout, dtype=np.float32)
 
 
-def extract_notes(audio_path):
+def extract_notes(audio_path, on_progress=None):
     """Return a list of (start_sec, end_sec, midi_int) notes for the sung melody."""
+    report = on_progress or (lambda fraction: None)
     y = decode_audio(audio_path)
+    report(0.05)
     if len(y) > MAX_SECONDS * SR:
         raise UserError(f"That song is longer than {MAX_SECONDS // 60} minutes. Please upload a shorter one.")
 
     # Track pitch in short pieces: doing a whole song at once needs well over 1 GB of memory
     chunk = CHUNK_SEC * SR  # a multiple of HOP, so frame times line up across pieces
     f0_parts, voiced_parts = [], []
+    total_pieces = max(1, -(-len(y) // chunk))
     for s in range(0, len(y), chunk):
         piece = y[s:s + chunk]
         is_last = s + chunk >= len(y)
@@ -88,6 +91,7 @@ def extract_notes(audio_path):
         keep = len(f0_p) if is_last else len(piece) // HOP  # last frame of a piece repeats the next piece's first
         f0_parts.append(f0_p[:keep])
         voiced_parts.append(voiced_p[:keep])
+        report(0.05 + 0.90 * len(f0_parts) / total_pieces)
     del y
     f0 = np.concatenate(f0_parts)
     voiced = np.concatenate(voiced_parts)
@@ -206,16 +210,16 @@ def generate_pdf(items, sa_name):
 
 
 def process_audio(path, sa_override, set_stage):
-    set_stage('Listening for the melody...')
-    notes = extract_notes(path)
-    set_stage('Working out Sa and the swaras...')
+    set_stage('Listening for the melody...', 0.02)
+    notes = extract_notes(path, lambda fraction: set_stage(None, fraction))
+    set_stage('Working out Sa and the swaras...', 0.96)
     if sa_override:
         sa_pc, confidence = NOTE_NAMES.index(sa_override), None
     else:
         sa_pc, confidence = detect_sa(notes)
     items = label_notes(notes, sa_pc)
     sa_name = NOTE_NAMES[sa_pc]
-    set_stage('Building your PDF...')
+    set_stage('Building your PDF...', 0.98)
     pdf = generate_pdf(items, sa_name)
     return {
         'swaras': [i['swara'] for i in items],
@@ -230,9 +234,12 @@ def process_audio(path, sa_override, set_stage):
 
 
 def run_job(job_id, path, sa_override):
-    def set_stage(text):
+    def set_stage(text, progress=None):
         with JOBS_LOCK:
-            JOBS[job_id]['stage'] = text
+            if text:
+                JOBS[job_id]['stage'] = text
+            if progress is not None:
+                JOBS[job_id]['progress'] = round(progress, 3)
     try:
         result = process_audio(path, sa_override, set_stage)
         with JOBS_LOCK:
@@ -277,7 +284,7 @@ def convert():
     upload.save(path)
     job_id = uuid.uuid4().hex
     with JOBS_LOCK:
-        JOBS[job_id] = {'status': 'running', 'stage': 'Starting...', 'created': time.time()}
+        JOBS[job_id] = {'status': 'running', 'stage': 'Starting...', 'progress': 0.0, 'created': time.time()}
     threading.Thread(target=run_job, args=(job_id, path, sa_override), daemon=True).start()
     return jsonify({'job_id': job_id}), 202
 
@@ -288,7 +295,7 @@ def job_status(job_id):
         job = JOBS.get(job_id)
         if not job:
             return jsonify({'error': 'Job not found. It may have expired - please upload again.'}), 404
-        body = {'status': job['status'], 'stage': job.get('stage')}
+        body = {'status': job['status'], 'stage': job.get('stage'), 'progress': job.get('progress', 0.0)}
         if job['status'] == 'done':
             body['result'] = job['result']
         elif job['status'] == 'error':
