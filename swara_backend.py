@@ -40,6 +40,7 @@ SILENCE_SKIP_SEC = 1.0     # silent stretches at least this long are not analyse
 # n_thresholds 50 is ~1.3x faster than the default 100 with no loss of notes. Coarser
 # `resolution` (0.2) is ~3x faster but drops many notes, so it is deliberately not used.
 PYIN_SETTINGS = dict(fmin=65, fmax=1050, sr=SR, frame_length=2048, hop_length=HOP, n_thresholds=50)
+REGLUE_GAP_SEC = 0.05     # same-pitch notes closer than this are one note (a glitch, not a repeat)
 MIN_NOTE_SEC = 0.08        # shorter blips are treated as noise
 JOB_TTL_SEC = 1800
 PITCH_VERSION = 'p3'       # bump when the pitch-tracking settings below change
@@ -228,7 +229,7 @@ def extract_notes(audio_path, on_progress=None):
     # Re-merge same-pitch neighbours separated only by a dropped blip
     merged = []
     for n in notes:
-        if merged and merged[-1][2] == n[2] and not n[3] and n[0] - merged[-1][1] <= 0.15:
+        if merged and merged[-1][2] == n[2] and not n[3] and n[0] - merged[-1][1] <= REGLUE_GAP_SEC:
             merged[-1][1] = n[1]
         else:
             merged.append(n)
@@ -254,9 +255,15 @@ def fold_octaves(notes):
     phrases.append(current)
 
     for ph in phrases:
-        for prev, cur in zip(ph, ph[1:]):
+        for i in range(1, len(ph)):
+            prev, cur = ph[i - 1], ph[i]
             jump = cur[2] - prev[2]
-            if abs(jump) >= 10:
+            if abs(jump) < 10:
+                continue
+            # A real octave leap stays up there; a voice mix-up is a spike that falls back.
+            nxt = ph[i + 1] if i + 1 < len(ph) else None
+            is_spike = nxt is not None and abs(nxt[2] - prev[2]) < abs(nxt[2] - cur[2])
+            if is_spike:
                 cur[2] -= 12 * round(jump / 12)
 
     medians = np.array([np.median([n[2] for n in ph]) for ph in phrases])
@@ -289,7 +296,9 @@ def label_notes(notes, sa_pc):
     """Turn midi notes into Indian-notation swaras, with octave marks and hold dashes."""
     pitches = np.array([n[2] for n in notes])
     med = int(round(np.median(pitches)))
-    sa_ref = med - ((med - sa_pc) % 12)  # Sa at or just below the typical sung pitch
+    # Middle octave = the Sa-to-Sa span that holds the most notes (ties: the one nearest the median)
+    candidates = [c for c in range(med - 12, med + 13) if (c - sa_pc) % 12 == 0]
+    sa_ref = max(candidates, key=lambda c: (int(np.sum((pitches >= c) & (pitches < c + 12))), -abs(c - med)))
     unit = max(0.1, float(np.median([n[1] - n[0] for n in notes])))  # a "normal" note length
     out = []
     for start, end, midi in notes:
