@@ -35,9 +35,14 @@ ALLOWED_EXT = {'.mp3', '.wav', '.m4a', '.ogg', '.flac', '.aac'}
 SR = 16000
 HOP = 640                  # 40 ms per analysis frame
 CHUNK_SEC = 15             # pitch is tracked this many seconds at a time to limit memory
+SILENCE_LEVEL = 0.03       # under 3% of the loudest moment counts as silence
+SILENCE_SKIP_SEC = 1.0     # silent stretches at least this long are not analysed at all
+# n_thresholds 50 is ~1.3x faster than the default 100 with no loss of notes. Coarser
+# `resolution` (0.2) is ~3x faster but drops many notes, so it is deliberately not used.
+PYIN_SETTINGS = dict(fmin=65, fmax=1050, sr=SR, frame_length=2048, hop_length=HOP, n_thresholds=50)
 MIN_NOTE_SEC = 0.08        # shorter blips are treated as noise
 JOB_TTL_SEC = 1800
-PITCH_VERSION = 'p1'       # bump when the pitch-tracking settings below change
+PITCH_VERSION = 'p3'       # bump when the pitch-tracking settings below change
 CACHE_DIR = os.path.join(tempfile.gettempdir(), 'swara_pitch_cache')
 CACHE_MAX_FILES = 20
 
@@ -117,23 +122,48 @@ def track_pitch(audio_path, report):
     # Loudness per frame: a dip inside a held pitch means the same note was sung again
     rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=HOP)[0]
 
+    # Skip long silent stretches (instrumental gaps, pauses): nothing to detect there
+    n_frames = len(rms)
+    silent = rms < SILENCE_LEVEL * rms.max()
+    min_run = int(SILENCE_SKIP_SEC * SR / HOP)
+    skip = np.zeros(n_frames, dtype=bool)
+    run_start = None
+    for i in range(n_frames + 1):
+        if i < n_frames and silent[i]:
+            if run_start is None:
+                run_start = i
+        else:
+            if run_start is not None and i - run_start >= min_run:
+                skip[run_start:i] = True
+            run_start = None
+
     # Track pitch in short pieces: doing a whole song at once needs well over 1 GB of memory
-    chunk = CHUNK_SEC * SR  # a multiple of HOP, so frame times line up across pieces
-    f0_parts, voiced_parts = [], []
-    total_pieces = max(1, -(-len(y) // chunk))
-    for s in range(0, len(y), chunk):
-        piece = y[s:s + chunk]
-        is_last = s + chunk >= len(y)
-        if len(piece) < SR // 2:
-            break
-        f0_p, voiced_p, _ = librosa.pyin(piece, fmin=65, fmax=1050, sr=SR, frame_length=2048, hop_length=HOP)
-        keep = len(f0_p) if is_last else len(piece) // HOP  # last frame of a piece repeats the next piece's first
-        f0_parts.append(f0_p[:keep])
-        voiced_parts.append(voiced_p[:keep])
-        report(0.05 + 0.90 * len(f0_parts) / total_pieces)
+    piece_frames = CHUNK_SEC * SR // HOP
+    pieces = []
+    i = 0
+    while i < n_frames:
+        if skip[i]:
+            i += 1
+            continue
+        j = i
+        while j < n_frames and not skip[j] and j - i < piece_frames:
+            j += 1
+        pieces.append((i, j))
+        i = j
+    f0 = np.full(n_frames, np.nan)
+    voiced = np.zeros(n_frames, dtype=bool)
+    total_frames = max(1, sum(b - a for a, b in pieces))
+    done = 0
+    for a, b in pieces:
+        piece = y[a * HOP:b * HOP]
+        if len(piece) < 4096:
+            piece = np.pad(piece, (0, 4096 - len(piece)))
+        f0_p, voiced_p, _ = librosa.pyin(piece, **PYIN_SETTINGS)
+        f0[a:b] = f0_p[:b - a]
+        voiced[a:b] = voiced_p[:b - a]
+        done += b - a
+        report(0.05 + 0.90 * done / total_frames)
     del y
-    f0 = np.concatenate(f0_parts)
-    voiced = np.concatenate(voiced_parts)
     _save_cached_pitch(cache_path, f0, voiced, rms)
     return f0, voiced, rms
 
