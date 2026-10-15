@@ -5,6 +5,7 @@ Upload a song (ideally vocals) -> detect the melody -> auto-detect Sa -> swaras 
 """
 
 import base64
+import hashlib
 import logging
 import os
 import subprocess
@@ -36,6 +37,9 @@ HOP = 640                  # 40 ms per analysis frame
 CHUNK_SEC = 15             # pitch is tracked this many seconds at a time to limit memory
 MIN_NOTE_SEC = 0.08        # shorter blips are treated as noise
 JOB_TTL_SEC = 1800
+PITCH_VERSION = 'p1'       # bump when the pitch-tracking settings below change
+CACHE_DIR = os.path.join(tempfile.gettempdir(), 'swara_pitch_cache')
+CACHE_MAX_FILES = 20
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_MB * 1024 * 1024
@@ -70,9 +74,41 @@ def decode_audio(path):
     return np.frombuffer(result.stdout, dtype=np.float32)
 
 
-def extract_notes(audio_path, on_progress=None):
-    """Return a list of (start_sec, end_sec, midi_int) notes for the sung melody."""
-    report = on_progress or (lambda fraction: None)
+def _cache_path(audio_path):
+    digest = hashlib.sha256()
+    with open(audio_path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 20), b''):
+            digest.update(block)
+    return os.path.join(CACHE_DIR, f'{PITCH_VERSION}-{digest.hexdigest()[:32]}.npz')
+
+
+def _load_cached_pitch(path):
+    try:
+        with np.load(path) as data:
+            return data['f0'], data['voiced'], data['rms']
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _save_cached_pitch(path, f0, voiced, rms):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        np.savez_compressed(path, f0=f0, voiced=voiced, rms=rms)
+        files = sorted((os.path.join(CACHE_DIR, n) for n in os.listdir(CACHE_DIR)), key=os.path.getmtime)
+        for old in files[:-CACHE_MAX_FILES]:
+            os.remove(old)
+    except OSError:
+        logger.warning("Could not write pitch cache")
+
+
+def track_pitch(audio_path, report):
+    """The slow step: returns per-frame pitch, voiced flags and loudness (cached per file)."""
+    cache_path = _cache_path(audio_path)
+    cached = _load_cached_pitch(cache_path)
+    if cached is not None:
+        report(0.95)
+        return cached
+
     y = decode_audio(audio_path)
     report(0.05)
     if len(y) > MAX_SECONDS * SR:
@@ -98,6 +134,14 @@ def extract_notes(audio_path, on_progress=None):
     del y
     f0 = np.concatenate(f0_parts)
     voiced = np.concatenate(voiced_parts)
+    _save_cached_pitch(cache_path, f0, voiced, rms)
+    return f0, voiced, rms
+
+
+def extract_notes(audio_path, on_progress=None):
+    """Return a list of (start_sec, end_sec, midi_int) notes for the sung melody."""
+    report = on_progress or (lambda fraction: None)
+    f0, voiced, rms = track_pitch(audio_path, report)
     good = voiced & ~np.isnan(f0)
     if good.sum() < 20:
         raise UserError("Couldn't find a clear melody in this audio. A vocals-only file works best.")
