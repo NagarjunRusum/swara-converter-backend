@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_MB = 60
 MAX_SECONDS = 480          # longer songs risk exhausting a small server
-ALLOWED_EXT = {'.mp3', '.wav', '.m4a', '.ogg', '.flac', '.aac'}
+ALLOWED_EXT = {'.mp3', '.wav', '.m4a', '.ogg', '.flac', '.aac', '.webm', '.mp4', '.opus', '.weba'}  # last four: what browsers record
 SR = 16000
 HOP = 640                  # 40 ms per analysis frame
 CHUNK_SEC = 15             # pitch is tracked this many seconds at a time to limit memory
@@ -519,7 +519,7 @@ def convert():
         return jsonify({'error': 'Please choose an audio file to upload.'}), 400
     ext = os.path.splitext(upload.filename)[1].lower()
     if ext not in ALLOWED_EXT:
-        return jsonify({'error': 'Please upload an mp3, wav, m4a, ogg or flac file.'}), 400
+        return jsonify({'error': 'Please upload an mp3, wav, m4a, ogg or flac file, or record one.'}), 400
     sa_override = (request.form.get('sa') or '').strip().upper() or None
     if sa_override and sa_override not in NOTE_NAMES:
         return jsonify({'error': 'Unknown Sa note.'}), 400
