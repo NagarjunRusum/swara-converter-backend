@@ -325,6 +325,25 @@ def snap_to_white_keys(notes, sa_pc):
     return [tuple(n) for n in glued]
 
 
+def make_item(offset, octave, dashes):
+    """Display fields for one note: swara text, hold dashes, and the key to press (Sa = C)."""
+    base, sharp = SWARA_AND_SHARP[offset]
+    text = HIGHER_FORM[base] if octave > 0 else base
+    if sharp:
+        text += '#'
+    if octave < 0:
+        text += '.'
+    return {
+        'text': text,
+        'dashes': dashes,
+        'swara': text + (' ' + ' '.join(['\u2014'] * dashes) if dashes else ''),
+        'keyboard': NOTE_NAMES[offset],
+        'midi': 60 + offset + 12 * octave,
+        'offset': int(offset),
+        'octave': int(octave),
+    }
+
+
 def label_notes(notes, sa_pc):
     """Turn midi notes into Indian-notation swaras, with octave marks and hold dashes."""
     pitches = np.array([n[2] for n in notes])
@@ -337,25 +356,15 @@ def label_notes(notes, sa_pc):
     for start, end, midi in notes:
         octave, offset = divmod(midi - sa_ref, 12)
         octave = max(-1, min(1, octave))
-        base, sharp = SWARA_AND_SHARP[offset]
-        text = HIGHER_FORM[base] if octave > 0 else base
-        if sharp:
-            text += '#'
-        if octave < 0:
-            text += '.'
         dashes = max(0, min(MAX_HOLD_DASHES, round((end - start) / unit) - 1))
-        out.append({
-            'text': text,
-            'dashes': dashes,
-            'swara': text + (' ' + ' '.join(['\u2014'] * dashes) if dashes else ''),
-            'keyboard': NOTE_NAMES[offset],                    # key to press, with Sa = C
-            'midi': 60 + offset + 12 * octave,                 # same, for MIDI playback (Sa = middle C)
+        item = make_item(offset, octave, dashes)
+        item.update({
             'real_keyboard': NOTE_NAMES[midi % 12],            # the pitch actually sung in the song
             'real_midi': int(midi),
-            'offset': int(offset),
             'time': round(float(start), 2),
             'duration': round(float(end - start), 2),
         })
+        out.append(item)
     return out
 
 
@@ -525,6 +534,30 @@ def job_status(job_id):
 @app.errorhandler(413)
 def too_large(_):
     return jsonify({'error': f'That file is too large. The limit is {MAX_UPLOAD_MB} MB.'}), 413
+
+
+MAX_EDITED_NOTES = 4000
+
+
+@app.route('/api/pdf', methods=['POST'])
+def edited_pdf():
+    """Rebuild the practice-sheet PDF from notes the user has edited on the page."""
+    body = request.get_json(silent=True) or {}
+    raw = body.get('notes')
+    sa_name = str(body.get('sa', 'C')).upper()
+    if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_EDITED_NOTES or sa_name not in NOTE_NAMES:
+        return jsonify({'error': 'Nothing to build a PDF from.'}), 400
+    items = []
+    try:
+        for n in raw:
+            offset, octave, dashes = int(n['offset']), int(n['octave']), int(n['dashes'])
+            if not (0 <= offset <= 11 and -1 <= octave <= 1 and 0 <= dashes <= MAX_HOLD_DASHES):
+                raise ValueError
+            items.append(make_item(offset, octave, dashes))
+    except (KeyError, TypeError, ValueError):
+        return jsonify({'error': 'Some notes were not valid.'}), 400
+    pdf = generate_pdf(items, sa_name, keyboard_transpose(NOTE_NAMES.index(sa_name)))
+    return jsonify({'pdf_base64': base64.b64encode(pdf).decode('ascii')})
 
 
 @app.route('/api/health', methods=['GET'])
