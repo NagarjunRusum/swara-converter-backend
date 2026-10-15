@@ -78,6 +78,9 @@ def extract_notes(audio_path, on_progress=None):
     if len(y) > MAX_SECONDS * SR:
         raise UserError(f"That song is longer than {MAX_SECONDS // 60} minutes. Please upload a shorter one.")
 
+    # Loudness per frame: a dip inside a held pitch means the same note was sung again
+    rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=HOP)[0]
+
     # Track pitch in short pieces: doing a whole song at once needs well over 1 GB of memory
     chunk = CHUNK_SEC * SR  # a multiple of HOP, so frame times line up across pieces
     f0_parts, voiced_parts = [], []
@@ -112,28 +115,51 @@ def extract_notes(audio_path, on_progress=None):
             midi[start:end] = medfilt(midi[start:end], 5)
 
     frame_sec = HOP / SR
-    notes = []  # [start, end, midi]
+    rms = np.concatenate([rms, np.zeros(max(0, len(midi) - len(rms)))])[:len(midi)]
+
+    def is_dip(i):
+        """True if frame i is a clear loudness valley, i.e. the singer re-struck the same pitch."""
+        left, right = rms[max(0, i - 5):i], rms[i + 1:i + 6]
+        if len(left) < 2 or len(right) < 2:
+            return False
+        return rms[i] < 0.6 * min(left.max(), right.max())
+
+    notes = []  # [start, end, midi, started_by_restrike]
+    restrike = False
     for i, m in enumerate(midi):
         if np.isnan(m):
             continue
         q = int(round(m))
         t = i * frame_sec
         if notes and notes[-1][2] == q and t - notes[-1][1] <= frame_sec * 1.5:
-            notes[-1][1] = t + frame_sec
+            if is_dip(i) and t - notes[-1][0] >= 0.16:
+                restrike = True      # the dip frame itself belongs to neither note
+            elif restrike:
+                notes.append([t, t + frame_sec, q, True])
+                restrike = False
+            else:
+                notes[-1][1] = t + frame_sec
         else:
-            notes.append([t, t + frame_sec, q])
+            restrike = False
+            notes.append([t, t + frame_sec, q, False])
 
     notes = [n for n in notes if n[1] - n[0] >= MIN_NOTE_SEC]
     # Re-merge same-pitch neighbours separated only by a dropped blip
     merged = []
     for n in notes:
-        if merged and merged[-1][2] == n[2] and n[0] - merged[-1][1] <= 0.15:
+        if merged and merged[-1][2] == n[2] and not n[3] and n[0] - merged[-1][1] <= 0.15:
             merged[-1][1] = n[1]
         else:
             merged.append(n)
     if len(merged) < 3:
         raise UserError("Couldn't find enough notes in this audio. A vocals-only file works best.")
-    return merged
+    # Men and women often sing the same tune an octave apart. Follow the melody's shape
+    # by moving any big jump to whichever octave lands closest to the previous note.
+    for prev, cur in zip(merged, merged[1:]):
+        jump = cur[2] - prev[2]
+        if abs(jump) >= 10:
+            cur[2] -= 12 * round(jump / 12)
+    return [tuple(n[:3]) for n in merged]
 
 
 def detect_sa(notes):
