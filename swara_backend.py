@@ -51,10 +51,11 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_MB * 1024 * 1024
 CORS(app)
 
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-# Semitones above Sa -> swara, in Indian notation (all lowercase)
-BASE_BY_OFFSET = ['sa', 're', 're', 'ga', 'ga', 'ma', 'ma', 'pa', 'dha', 'dha', 'ni', 'ni']
-KOMAL_OFFSETS = {1, 3, 8, 10}
-TIVRA_OFFSETS = {6}
+# Semitones above Sa -> (swara, sharp?). Every black key is written as the swara just
+# below it plus '#', so '#' always means "the black key right after this one".
+SWARA_AND_SHARP = [('sa', False), ('sa', True), ('re', False), ('re', True), ('ga', False),
+                   ('ma', False), ('ma', True), ('pa', False), ('pa', True), ('dha', False),
+                   ('dha', True), ('ni', False)]
 HIGHER_FORM = {'sa': 's\u00e0', 're': 'r\u00e8', 'ga': 'g\u00e0', 'ma': 'm\u00e0',
                'pa': 'p\u00e0', 'dha': 'dh\u00e0', 'ni': 'n\u00ec'}  # grave accent = higher octave
 PHRASE_GAP_SEC = 0.8       # a pause this long starts a new phrase
@@ -294,19 +295,17 @@ def label_notes(notes, sa_pc):
     for start, end, midi in notes:
         octave, offset = divmod(midi - sa_ref, 12)
         octave = max(-1, min(1, octave))
-        base = BASE_BY_OFFSET[offset]
+        base, sharp = SWARA_AND_SHARP[offset]
         text = HIGHER_FORM[base] if octave > 0 else base
+        if sharp:
+            text += '#'
         if octave < 0:
             text += '.'
-        komal, tivra = offset in KOMAL_OFFSETS, offset in TIVRA_OFFSETS
-        if tivra:
-            text += "'"
         dashes = max(0, min(MAX_HOLD_DASHES, round((end - start) / unit) - 1))
         out.append({
             'text': text,
-            'komal': komal,
             'dashes': dashes,
-            'swara': text + ('(k)' if komal else '') + (' ' + ' '.join(['\u2014'] * dashes) if dashes else ''),
+            'swara': text + (' ' + ' '.join(['\u2014'] * dashes) if dashes else ''),
             'keyboard': NOTE_NAMES[offset],                    # key to press, with Sa = C
             'midi': 60 + offset + 12 * octave,                 # same, for MIDI playback (Sa = middle C)
             'real_keyboard': NOTE_NAMES[midi % 12],            # the pitch actually sung in the song
@@ -351,8 +350,7 @@ def generate_pdf(items, sa_name, transpose):
         key_style = ParagraphStyle('K', parent=base['Normal'], fontSize=10, textColor=colors.grey,
                                    alignment=TA_CENTER, spaceAfter=16)
         def token(c):
-            t = f"<u>{c['text']}</u>" if c['komal'] else c['text']
-            return t + ''.join('&nbsp;\u2014' for _ in range(c['dashes']))
+            return c['text'] + ''.join('&nbsp;\u2014' for _ in range(c['dashes']))
 
         # Fill each row up to about 38 characters so a row never wraps, and the keyboard
         # letters underneath always line up with the notes above them
@@ -372,7 +370,7 @@ def generate_pdf(items, sa_name, transpose):
         story.append(Spacer(1, 0.3 * inch))
         story.append(Paragraph(
             "<b>How to read this:</b> sa. = lower octave | sa = middle octave | s\u00e0 = higher octave<br/>"
-            "An <u>underlined</u> swara is komal (flat). A swara with ' after it, like ma', is tivra (sharp).<br/>"
+            "A # after a swara (sa#, re#, ma#...) means the black key right after that swara's key.<br/>"
             "A dash (\u2014) after a swara means hold that note for longer.<br/>"
             "The grey letters under each line are the keys to press, counting sa as C.",
             ParagraphStyle('G', parent=base['Normal'], fontSize=10, textColor=colors.HexColor('#666666'),
