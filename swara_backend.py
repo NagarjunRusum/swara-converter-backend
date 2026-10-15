@@ -47,6 +47,8 @@ MEDIAN_KERNEL = 3          # frames of pitch smoothing (5 blurred short notes)
 DIP_RATIO = 0.6            # loudness valley (vs neighbours) that marks a re-struck note
 DIP_WINDOW = 5             # frames each side used to judge a valley
 DIP_MIN_NOTE_SEC = 0.16    # a note must already be this long before it can be split
+SHAKY_STABILITY = 0.5      # a note whose pitch stays within half a semitone less often than this is flagged
+SHAKY_SHORT_SEC = 0.10     # notes shorter than this are flagged too
 MIN_NOTE_SEC = 0.08        # shorter blips are treated as noise
 JOB_TTL_SEC = 1800
 PITCH_VERSION = 'p4'       # bump when the pitch-tracking settings below change
@@ -183,7 +185,7 @@ def track_pitch(audio_path, report):
 
 
 def extract_notes(audio_path, on_progress=None):
-    """Return a list of (start_sec, end_sec, midi_int) notes for the sung melody."""
+    """Return a list of (start_sec, end_sec, midi_int, shaky) notes for the sung melody."""
     report = on_progress or (lambda fraction: None)
     f0, voiced, rms = track_pitch(audio_path, report)
     good = voiced & ~np.isnan(f0)
@@ -212,7 +214,7 @@ def extract_notes(audio_path, on_progress=None):
             return False
         return rms[i] < DIP_RATIO * min(left.max(), right.max())
 
-    notes = []  # [start, end, midi, started_by_restrike]
+    notes = []  # [start, end, midi, started_by_restrike, first_frame, last_frame]
     restrike = False
     for i, m in enumerate(midi):
         if np.isnan(m):
@@ -223,13 +225,14 @@ def extract_notes(audio_path, on_progress=None):
             if is_dip(i) and t - notes[-1][0] >= DIP_MIN_NOTE_SEC:
                 restrike = True      # the dip frame itself belongs to neither note
             elif restrike:
-                notes.append([t, t + frame_sec, q, True])
+                notes.append([t, t + frame_sec, q, True, i, i])
                 restrike = False
             else:
                 notes[-1][1] = t + frame_sec
+                notes[-1][5] = i
         else:
             restrike = False
-            notes.append([t, t + frame_sec, q, False])
+            notes.append([t, t + frame_sec, q, False, i, i])
 
     notes = [n for n in notes if n[1] - n[0] >= MIN_NOTE_SEC]
     # Re-merge same-pitch neighbours separated only by a dropped blip
@@ -237,11 +240,18 @@ def extract_notes(audio_path, on_progress=None):
     for n in notes:
         if merged and merged[-1][2] == n[2] and not n[3] and n[0] - merged[-1][1] <= REGLUE_GAP_SEC:
             merged[-1][1] = n[1]
+            merged[-1][5] = n[5]
         else:
             merged.append(n)
     if len(merged) < 3:
         raise UserError("Couldn't find enough notes in this audio. A vocals-only file works best.")
-    return fold_octaves(merged)
+    flagged = []
+    for start, end, q, _, i0, i1 in merged:
+        frames = midi[i0:i1 + 1]
+        frames = frames[~np.isnan(frames)]
+        steady = len(frames) < 3 or np.mean(np.abs(frames - q) <= 0.5) >= SHAKY_STABILITY
+        flagged.append([start, end, q, (not steady) or (end - start) < SHAKY_SHORT_SEC])
+    return fold_octaves(flagged)
 
 
 def fold_octaves(notes):
@@ -251,9 +261,9 @@ def fold_octaves(notes):
     jump is moved to whichever octave lands nearest the previous note; then each
     whole phrase is moved to the octave nearest the song's usual range.
     """
-    phrases, current = [], [list(notes[0][:3])]
+    phrases, current = [], [list(notes[0][:4])]
     for prev, cur in zip(notes, notes[1:]):
-        note = list(cur[:3])
+        note = list(cur[:4])
         if note[0] - prev[1] >= PHRASE_GAP_SEC:
             phrases.append(current)
             current = []
@@ -279,14 +289,14 @@ def fold_octaves(notes):
     out = []
     for ph, pm in zip(phrases, medians):
         shift = 12 * round((ref - pm) / 12)
-        out.extend((n[0], n[1], n[2] + shift) for n in ph)
+        out.extend((n[0], n[1], n[2] + shift, n[3]) for n in ph)
     return out
 
 
 def detect_sa(notes):
     """Guess Sa (the home note) from which pitches the melody dwells on."""
     hist = np.zeros(12)
-    for start, end, midi in notes:
+    for start, end, midi, *_ in notes:
         hist[midi % 12] += end - start
     best_score, best_pc = -2, 0
     for pc in range(12):
@@ -305,9 +315,10 @@ def snap_to_white_keys(notes, sa_pc):
     """For songs that use only the 7 plain swaras: drop short black-key notes (slides) and
     move longer ones to the neighbouring white key that matches the surrounding notes."""
     out = []
-    for i, (start, end, midi) in enumerate(notes):
+    for i, (start, end, midi, *rest) in enumerate(notes):
+        shaky = bool(rest[0]) if rest else False
         if (midi - sa_pc) % 12 in MAJOR_SCALE:
-            out.append([start, end, midi])
+            out.append([start, end, midi, shaky])
             continue
         if end - start < 0.2:
             continue
@@ -315,11 +326,12 @@ def snap_to_white_keys(notes, sa_pc):
         nxt = notes[i + 1][2] if i + 1 < len(notes) else None
         options = [c for c in (midi - 1, midi + 1) if (c - sa_pc) % 12 in MAJOR_SCALE]
         pick = [c for c in options if c in (prev, nxt)] or options
-        out.append([start, end, min(pick)])
+        out.append([start, end, min(pick), True])   # moved to a white key: worth a listen
     glued = []
     for n in out:
         if glued and glued[-1][2] == n[2] and n[0] - glued[-1][1] < 0.08:
             glued[-1][1] = n[1]
+            glued[-1][3] = glued[-1][3] or n[3]
         else:
             glued.append(n)
     return [tuple(n) for n in glued]
@@ -353,7 +365,7 @@ def label_notes(notes, sa_pc):
     sa_ref = max(candidates, key=lambda c: (int(np.sum((pitches >= c) & (pitches < c + 12))), -abs(c - med)))
     unit = max(0.1, float(np.median([n[1] - n[0] for n in notes])))  # a "normal" note length
     out = []
-    for start, end, midi in notes:
+    for start, end, midi, *rest in notes:
         octave, offset = divmod(midi - sa_ref, 12)
         octave = max(-1, min(1, octave))
         dashes = max(0, min(MAX_HOLD_DASHES, round((end - start) / unit) - 1))
@@ -361,6 +373,7 @@ def label_notes(notes, sa_pc):
         item.update({
             'real_keyboard': NOTE_NAMES[midi % 12],            # the pitch actually sung in the song
             'real_midi': int(midi),
+            'uncertain': bool(rest[0]) if rest else False,
             'time': round(float(start), 2),
             'duration': round(float(end - start), 2),
         })
