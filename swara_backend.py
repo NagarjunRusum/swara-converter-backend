@@ -51,8 +51,14 @@ app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_MB * 1024 * 1024
 CORS(app)
 
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-# Semitones above Sa -> swara (b = komal/flat, # = tivra/sharp)
-SWARA_BY_OFFSET = ['Sa', 'Reb', 'Re', 'Gab', 'Ga', 'Ma', 'Ma#', 'Pa', 'Dhab', 'Dha', 'Nib', 'Ni']
+# Semitones above Sa -> swara, in Indian notation (all lowercase)
+BASE_BY_OFFSET = ['sa', 're', 're', 'ga', 'ga', 'ma', 'ma', 'pa', 'dha', 'dha', 'ni', 'ni']
+KOMAL_OFFSETS = {1, 3, 8, 10}
+TIVRA_OFFSETS = {6}
+HIGHER_FORM = {'sa': 's\u00e0', 're': 'r\u00e8', 'ga': 'g\u00e0', 'ma': 'm\u00e0',
+               'pa': 'p\u00e0', 'dha': 'dh\u00e0', 'ni': 'n\u00ec'}  # grave accent = higher octave
+PHRASE_GAP_SEC = 0.8       # a pause this long starts a new phrase
+MAX_HOLD_DASHES = 4
 
 # Krumhansl-Kessler key profiles, used to guess the home note (Sa)
 MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
@@ -227,13 +233,40 @@ def extract_notes(audio_path, on_progress=None):
             merged.append(n)
     if len(merged) < 3:
         raise UserError("Couldn't find enough notes in this audio. A vocals-only file works best.")
-    # Men and women often sing the same tune an octave apart. Follow the melody's shape
-    # by moving any big jump to whichever octave lands closest to the previous note.
-    for prev, cur in zip(merged, merged[1:]):
-        jump = cur[2] - prev[2]
-        if abs(jump) >= 10:
-            cur[2] -= 12 * round(jump / 12)
-    return [tuple(n[:3]) for n in merged]
+    return fold_octaves(merged)
+
+
+def fold_octaves(notes):
+    """Keep the melody in one octave range.
+
+    Men and women often sing the same tune an octave apart. Inside a phrase, a big
+    jump is moved to whichever octave lands nearest the previous note; then each
+    whole phrase is moved to the octave nearest the song's usual range.
+    """
+    phrases, current = [], [list(notes[0][:3])]
+    for prev, cur in zip(notes, notes[1:]):
+        note = list(cur[:3])
+        if note[0] - prev[1] >= PHRASE_GAP_SEC:
+            phrases.append(current)
+            current = []
+        current.append(note)
+    phrases.append(current)
+
+    for ph in phrases:
+        for prev, cur in zip(ph, ph[1:]):
+            jump = cur[2] - prev[2]
+            if abs(jump) >= 10:
+                cur[2] -= 12 * round(jump / 12)
+
+    medians = np.array([np.median([n[2] for n in ph]) for ph in phrases])
+    # reference range = the pitch that the most phrases sit within 6 semitones of
+    counts = [np.sum(np.abs(medians - m) < 6) for m in medians]
+    ref = float(np.median(medians[np.abs(medians - medians[int(np.argmax(counts))]) < 6]))
+    out = []
+    for ph, pm in zip(phrases, medians):
+        shift = 12 * round((ref - pm) / 12)
+        out.extend((n[0], n[1], n[2] + shift) for n in ph)
+    return out
 
 
 def detect_sa(notes):
@@ -252,21 +285,28 @@ def detect_sa(notes):
 
 
 def label_notes(notes, sa_pc):
-    """Turn midi notes into swara labels, with octave shown by letter case."""
+    """Turn midi notes into Indian-notation swaras, with octave marks and hold dashes."""
     pitches = np.array([n[2] for n in notes])
     med = int(round(np.median(pitches)))
     sa_ref = med - ((med - sa_pc) % 12)  # Sa at or just below the typical sung pitch
+    unit = max(0.1, float(np.median([n[1] - n[0] for n in notes])))  # a "normal" note length
     out = []
     for start, end, midi in notes:
-        rel = midi - sa_ref
-        octave, offset = divmod(rel, 12)
-        name = SWARA_BY_OFFSET[offset]
+        octave, offset = divmod(midi - sa_ref, 12)
+        octave = max(-1, min(1, octave))
+        base = BASE_BY_OFFSET[offset]
+        text = HIGHER_FORM[base] if octave > 0 else base
         if octave < 0:
-            name = name.lower()
-        elif octave > 0:
-            name = name.upper()
+            text += '.'
+        komal, tivra = offset in KOMAL_OFFSETS, offset in TIVRA_OFFSETS
+        if tivra:
+            text += "'"
+        dashes = max(0, min(MAX_HOLD_DASHES, round((end - start) / unit) - 1))
         out.append({
-            'swara': name,
+            'text': text,
+            'komal': komal,
+            'dashes': dashes,
+            'swara': text + ('(k)' if komal else '') + (' ' + ' '.join(['\u2014'] * dashes) if dashes else ''),
             'keyboard': NOTE_NAMES[midi % 12],
             'midi': int(midi),
             'offset': int(offset),
@@ -293,17 +333,33 @@ def generate_pdf(items, sa_name):
                                     alignment=TA_CENTER, leading=22, spaceAfter=2)
         key_style = ParagraphStyle('K', parent=base['Normal'], fontSize=10, textColor=colors.grey,
                                    alignment=TA_CENTER, spaceAfter=16)
-        per_line = 12
-        for i in range(0, len(items), per_line):
-            chunk = items[i:i + per_line]
-            story.append(Paragraph(' '.join(c['swara'] for c in chunk), line_style))
+        def token(c):
+            t = f"<u>{c['text']}</u>" if c['komal'] else c['text']
+            return t + ''.join('&nbsp;\u2014' for _ in range(c['dashes']))
+
+        # Fill each row up to about 38 characters so a row never wraps, and the keyboard
+        # letters underneath always line up with the notes above them
+        rows, row, width = [], [], 0
+        for c in items:
+            w = len(c['text']) + 2 * c['dashes'] + 1
+            if row and width + w > 38:
+                rows.append(row)
+                row, width = [], 0
+            row.append(c)
+            width += w
+        if row:
+            rows.append(row)
+        for chunk in rows:
+            story.append(Paragraph(' '.join(token(c) for c in chunk), line_style))
             story.append(Paragraph('(' + ' '.join(c['keyboard'] for c in chunk) + ')', key_style))
         story.append(Spacer(1, 0.3 * inch))
         story.append(Paragraph(
-            "<b>Notation guide:</b> lowercase (sa) = lower octave | Normal (Sa) = middle octave | "
-            "UPPERCASE (SA) = higher octave<br/>b after a name = komal (flat), # = tivra (sharp), "
-            "e.g. Gab = komal Ga. Grey letters below each line are the keyboard keys.",
-            ParagraphStyle('G', parent=base['Normal'], fontSize=10, textColor=colors.HexColor('#666666'))))
+            "<b>How to read this:</b> sa. = lower octave | sa = middle octave | s\u00e0 = higher octave<br/>"
+            "An <u>underlined</u> swara is komal (flat). A swara with ' after it, like ma', is tivra (sharp).<br/>"
+            "A dash (\u2014) after a swara means hold that note for longer.<br/>"
+            "The grey letters under each line are the keyboard keys to press.",
+            ParagraphStyle('G', parent=base['Normal'], fontSize=10, textColor=colors.HexColor('#666666'),
+                           leading=14)))
         doc.build(story)
         with open(path, 'rb') as f:
             return f.read()
